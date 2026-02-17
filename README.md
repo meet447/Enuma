@@ -8,18 +8,29 @@ A super fast, lightweight, terminal-based anime watcher written in Rust.
 - Stream episodes directly in `mpv`.
 
 ## Requirements
-- Rust (to build)
 - `mpv` player (must be in your PATH)
 
+## Installation
+
+### Quick Install (Recommended)
+
+**macOS/Linux:**
+```bash
+curl -sSL https://raw.githubusercontent.com/meet447/Enuma/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+iwr -useb https://raw.githubusercontent.com/meet447/Enuma/main/install.ps1 | iex
+```
+
+### Build from Source
+```bash
+cargo build --release
+./target/release/Enuma
+```
+
 ## Usage
-1. Build the project:
-   ```bash
-   cargo build --release
-   ```
-2. Run the binary:
-   ```bash
-   ./target/release/Enuma
-   ```
 3. Controls:
    - **Type**: Search query.
    - **Enter**: Search / Select / Play.
