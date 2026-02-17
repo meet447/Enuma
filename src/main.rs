@@ -1,7 +1,7 @@
 mod api;
 
 use anyhow::Result;
-use api::{AnimeClient, Anime, Episode};
+use api::{AnimeClient, Anime, Episode, StreamItem};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -26,13 +26,14 @@ pub struct HistoryItem {
     pub last_watched: String,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone)]
 enum CurrentScreen {
     Search,
     SearchResults,
     EpisodeList,
     Library,
     History,
+    QualitySelection,
 }
 
 struct App {
@@ -58,6 +59,12 @@ struct App {
     // History
     history: Vec<HistoryItem>,
     history_list_state: ListState,
+
+    // Quality Selection
+    available_streams: Vec<StreamItem>,
+    quality_list_state: ListState,
+    temp_play_data: Option<(Anime, String, String)>,
+    previous_screen: Option<CurrentScreen>,
 
     // Status
     status_message: String,
@@ -90,6 +97,10 @@ impl App {
             library_list_state: ListState::default(),
             history,
             history_list_state: ListState::default(),
+            available_streams: Vec::new(),
+            quality_list_state: ListState::default(),
+            temp_play_data: None,
+            previous_screen: None,
             status_message: String::from("Press '/' to search, 'l' for library, 'h' for history"),
             is_searching: false,
             is_loading: false,
@@ -209,7 +220,7 @@ impl App {
         }
     }
 
-    async fn play_episode(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    async fn play_episode(&mut self) -> Result<()> {
         let ep_data = if let Some(i) = self.episode_list_state.selected() {
             self.episode_list.get(i).map(|ep| (ep.session.clone(), ep.episode.clone()))
         } else {
@@ -218,47 +229,68 @@ impl App {
 
         if let Some((ep_session, ep_num)) = ep_data {
             if let Some(anime) = self.selected_anime.clone() {
-                self.play_episode_internal(terminal, anime, ep_session, ep_num).await?;
+                self.prepare_stream_selection(anime, ep_session, ep_num).await?;
             }
         }
         Ok(())
     }
 
-    async fn play_episode_internal(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>, anime: Anime, ep_session: String, ep_num: String) -> Result<()> {
+    async fn prepare_stream_selection(&mut self, anime: Anime, ep_session: String, ep_num: String) -> Result<()> {
         let series_session = anime.session.clone();
-        let anime_title = anime.title.clone();
+        self.selected_anime = Some(anime.clone());
         self.is_loading = true;
         self.status_message = format!("Fetching streams for Ep {}...", ep_num);
         
         match self.client.get_stream(&series_session, &ep_session).await {
             Ok(streams) => {
-                let best_stream = streams.iter()
-                    .find(|s| s.name.contains("1080p"))
-                    .or_else(|| streams.iter().find(|s| s.name.contains("720p")))
-                    .or_else(|| streams.first());
-
-                if let Some(link_item) = best_stream {
-                    self.status_message = format!("Extracting stream URL ({})...", link_item.name);
-                    
-                    match self.client.extract_stream_url(&link_item.link).await {
-                        Ok(direct_url) => {
-                            self.is_loading = false;
-                            self.record_history(anime, ep_session, ep_num.clone());
-                            self.launch_mpv(terminal, &direct_url, &anime_title, &ep_num).await?;
-                        }
-                        Err(e) => {
-                            self.is_loading = false;
-                            self.status_message = format!("Failed to extract stream: {}", e);
-                        }
-                    }
-                } else {
-                    self.is_loading = false;
+                self.is_loading = false;
+                if streams.is_empty() {
                     self.status_message = "No streams found.".to_string();
+                    return Ok(());
                 }
+                
+                self.available_streams = streams;
+                self.quality_list_state.select(Some(0));
+                self.temp_play_data = Some((anime, ep_session, ep_num));
+                self.previous_screen = Some(self.current_screen.clone());
+                self.current_screen = CurrentScreen::QualitySelection;
+                self.status_message = "Select video quality. Enter to play, Esc to go back.".to_string();
             }
             Err(e) => {
                  self.is_loading = false;
                  self.status_message = format!("Error fetching stream: {}", e);
+            }
+        }
+        Ok(())
+    }
+
+    async fn play_selected_stream(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+        let stream_idx = self.quality_list_state.selected();
+        let play_data = self.temp_play_data.clone();
+        
+        if let (Some(idx), Some((anime, ep_session, ep_num))) = (stream_idx, play_data) {
+            if let Some(link_item) = self.available_streams.get(idx).cloned() {
+                let anime_title = anime.title.clone();
+                let link = link_item.link.clone();
+                let quality_name = link_item.name.clone();
+                
+                self.is_loading = true;
+                self.status_message = format!("Extracting stream URL ({})...", quality_name);
+                
+                match self.client.extract_stream_url(&link).await {
+                    Ok(direct_url) => {
+                        self.is_loading = false;
+                        self.record_history(anime, ep_session, ep_num.clone());
+                        self.launch_mpv(terminal, &direct_url, &anime_title, &ep_num).await?;
+                        if let Some(prev) = self.previous_screen.clone() {
+                            self.current_screen = prev;
+                        }
+                    }
+                    Err(e) => {
+                        self.is_loading = false;
+                        self.status_message = format!("Failed to extract stream: {}", e);
+                    }
+                }
             }
         }
         Ok(())
@@ -469,7 +501,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                     KeyCode::Enter => {
                         if let Some(i) = app.history_list_state.selected() {
                             if let Some(item) = app.history.get(i).cloned() {
-                                app.play_episode_internal(terminal, item.anime, item.episode_session, item.last_episode).await?;
+                                app.prepare_stream_selection(item.anime, item.episode_session, item.last_episode).await?;
                             }
                         }
                     }
@@ -506,7 +538,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                         app.search_query.clear();
                     }
                     KeyCode::Enter => {
-                        app.play_episode(terminal).await?;
+                        app.play_episode().await?;
                     }
                     KeyCode::Esc => {
                         app.current_screen = match () {
@@ -514,6 +546,33 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                             _ if !app.library.is_empty() => CurrentScreen::Library,
                             _ => CurrentScreen::Search,
                         };
+                    }
+                    _ => {}
+                }
+                CurrentScreen::QualitySelection => match key.code {
+                    KeyCode::Up => {
+                        let i = match app.quality_list_state.selected() {
+                            Some(i) => if i == 0 { app.available_streams.len().saturating_sub(1) } else { i - 1 },
+                            None => 0,
+                        };
+                        app.quality_list_state.select(Some(i));
+                    }
+                    KeyCode::Down => {
+                        let i = match app.quality_list_state.selected() {
+                            Some(i) => if i >= app.available_streams.len().saturating_sub(1) { 0 } else { i + 1 },
+                            None => 0,
+                        };
+                        app.quality_list_state.select(Some(i));
+                    }
+                    KeyCode::Enter => {
+                        app.play_selected_stream(terminal).await?;
+                    }
+                    KeyCode::Esc => {
+                        if let Some(prev) = app.previous_screen.clone() {
+                            app.current_screen = prev;
+                        } else {
+                            app.current_screen = CurrentScreen::EpisodeList;
+                        }
                     }
                     _ => {}
                 }
@@ -594,6 +653,19 @@ fn ui(f: &mut Frame, app: &mut App) {
                 .highlight_symbol("▶ ");
                 
             f.render_stateful_widget(list, chunks[1], &mut app.episode_list_state);
+        }
+        CurrentScreen::QualitySelection => {
+             let items: Vec<ListItem> = app.available_streams
+                .iter()
+                .map(|s| ListItem::new(format!(" {}", s.name)))
+                .collect();
+
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(" Select Quality ").border_style(Style::default().fg(Color::Cyan)))
+                .highlight_style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))
+                .highlight_symbol("▶ ");
+                
+            f.render_stateful_widget(list, chunks[1], &mut app.quality_list_state);
         }
     }
 }
