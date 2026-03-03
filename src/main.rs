@@ -14,7 +14,10 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
-use std::{io::{self, Stdout}, process::Command};
+use std::collections::HashSet;
+use std::io::{self, Stdout};
+use std::path::PathBuf;
+use tokio::process::Command;
 use serde::{Deserialize, Serialize};
 use chrono;
 
@@ -77,11 +80,41 @@ struct App {
     animation_tick: u32,
 }
 
+fn cycle_selection(state: &mut ListState, len: usize, up: bool) {
+    let i = match state.selected() {
+        Some(i) => {
+            if up {
+                if i == 0 { len.saturating_sub(1) } else { i - 1 }
+            } else if i >= len.saturating_sub(1) { 0 } else { i + 1 }
+        }
+        None => 0,
+    };
+    state.select(Some(i));
+}
+
+fn data_dir() -> PathBuf {
+    let dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("enuma");
+    std::fs::create_dir_all(&dir).ok();
+    dir
+}
+
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}...", truncated)
+    } else {
+        truncated
+    }
+}
+
 impl App {
     fn new() -> Result<Self> {
         let library = Self::load_data::<Vec<Anime>>("library.json").unwrap_or_default();
         let history = Self::load_data::<Vec<HistoryItem>>("history.json").unwrap_or_default();
-        
+
         Ok(Self {
             client: AnimeClient::new()?,
             current_screen: CurrentScreen::Search,
@@ -108,8 +141,9 @@ impl App {
         })
     }
 
-    fn load_data<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T> {
-        if std::path::Path::new(path).exists() {
+    fn load_data<T: for<'de> Deserialize<'de>>(filename: &str) -> Result<T> {
+        let path = data_dir().join(filename);
+        if path.exists() {
             let content = std::fs::read_to_string(path)?;
             Ok(serde_json::from_str(&content)?)
         } else {
@@ -117,39 +151,57 @@ impl App {
         }
     }
 
-    fn save_data<T: Serialize>(path: &str, data: &T) -> Result<()> {
+    fn save_data<T: Serialize>(filename: &str, data: &T) -> Result<()> {
+        let path = data_dir().join(filename);
         let content = serde_json::to_string_pretty(data)?;
         std::fs::write(path, content)?;
         Ok(())
     }
 
     fn toggle_library(&mut self) {
-        let anime = match self.current_screen {
+        let session = match self.current_screen {
             CurrentScreen::SearchResults => {
                 self.search_list_state.selected()
-                    .and_then(|i| self.search_results.get(i).cloned())
+                    .and_then(|i| self.search_results.get(i))
+                    .map(|a| a.session.as_str())
             }
             CurrentScreen::Library => {
                 self.library_list_state.selected()
-                    .and_then(|i| self.library.get(i).cloned())
+                    .and_then(|i| self.library.get(i))
+                    .map(|a| a.session.as_str())
             }
             CurrentScreen::History => {
                 self.history_list_state.selected()
-                    .and_then(|i| self.history.get(i).map(|h| h.anime.clone()))
+                    .and_then(|i| self.history.get(i))
+                    .map(|h| h.anime.session.as_str())
             }
             _ => None,
         };
 
-        if let Some(anime) = anime {
-            if let Some(pos) = self.library.iter().position(|f| f.session == anime.session) {
-                self.library.remove(pos);
-                self.status_message = format!("Removed '{}' from library", anime.title);
-            } else {
-                self.library.push(anime.clone());
+        let Some(session) = session.map(String::from) else { return };
+
+        if let Some(pos) = self.library.iter().position(|f| f.session == session) {
+            let title = self.library[pos].title.clone();
+            self.library.remove(pos);
+            self.status_message = format!("Removed '{}' from library", title);
+        } else {
+            let anime = match self.current_screen {
+                CurrentScreen::SearchResults => {
+                    self.search_list_state.selected()
+                        .and_then(|i| self.search_results.get(i).cloned())
+                }
+                CurrentScreen::History => {
+                    self.history_list_state.selected()
+                        .and_then(|i| self.history.get(i).map(|h| h.anime.clone()))
+                }
+                _ => None,
+            };
+            if let Some(anime) = anime {
                 self.status_message = format!("Added '{}' to library", anime.title);
+                self.library.push(anime);
             }
-            let _ = Self::save_data("library.json", &self.library);
         }
+        let _ = Self::save_data("library.json", &self.library);
     }
 
     fn record_history(&mut self, anime: Anime, ep_session: String, ep_num: String) {
@@ -221,26 +273,22 @@ impl App {
     }
 
     async fn play_episode(&mut self) -> Result<()> {
-        let ep_data = if let Some(i) = self.episode_list_state.selected() {
-            self.episode_list.get(i).map(|ep| (ep.session.clone(), ep.episode.clone()))
-        } else {
-            None
-        };
-
-        if let Some((ep_session, ep_num)) = ep_data {
-            if let Some(anime) = self.selected_anime.clone() {
-                self.prepare_stream_selection(anime, ep_session, ep_num).await?;
-            }
+        let Some(i) = self.episode_list_state.selected() else { return Ok(()) };
+        let Some(ep) = self.episode_list.get(i) else { return Ok(()) };
+        let ep_session = ep.session.clone();
+        let ep_num = ep.episode.clone();
+        if let Some(anime) = self.selected_anime.clone() {
+            self.prepare_stream_selection(anime, ep_session, ep_num).await?;
         }
         Ok(())
     }
 
     async fn prepare_stream_selection(&mut self, anime: Anime, ep_session: String, ep_num: String) -> Result<()> {
-        let series_session = anime.session.clone();
-        self.selected_anime = Some(anime.clone());
         self.is_loading = true;
         self.status_message = format!("Fetching streams for Ep {}...", ep_num);
-        
+        let series_session = anime.session.clone();
+        self.selected_anime = Some(anime.clone());
+
         match self.client.get_stream(&series_session, &ep_session).await {
             Ok(streams) => {
                 self.is_loading = false;
@@ -265,32 +313,33 @@ impl App {
     }
 
     async fn play_selected_stream(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-        let stream_idx = self.quality_list_state.selected();
-        let play_data = self.temp_play_data.clone();
-        
-        if let (Some(idx), Some((anime, ep_session, ep_num))) = (stream_idx, play_data) {
-            if let Some(link_item) = self.available_streams.get(idx).cloned() {
-                let anime_title = anime.title.clone();
-                let link = link_item.link.clone();
-                let quality_name = link_item.name.clone();
-                
-                self.is_loading = true;
-                self.status_message = format!("Extracting stream URL ({})...", quality_name);
-                
-                match self.client.extract_stream_url(&link).await {
-                    Ok(direct_url) => {
-                        self.is_loading = false;
-                        self.record_history(anime, ep_session, ep_num.clone());
-                        self.launch_mpv(terminal, &direct_url, &anime_title, &ep_num).await?;
-                        if let Some(prev) = self.previous_screen.clone() {
-                            self.current_screen = prev;
-                        }
-                    }
-                    Err(e) => {
-                        self.is_loading = false;
-                        self.status_message = format!("Failed to extract stream: {}", e);
-                    }
+        let Some(idx) = self.quality_list_state.selected() else { return Ok(()) };
+        let Some((anime, ep_session, ep_num)) = self.temp_play_data.take() else { return Ok(()) };
+        let Some(link_item) = self.available_streams.get(idx) else {
+            self.temp_play_data = Some((anime, ep_session, ep_num));
+            return Ok(());
+        };
+
+        let link = link_item.link.clone();
+        let quality_name = link_item.name.clone();
+
+        self.is_loading = true;
+        self.status_message = format!("Extracting stream URL ({})...", quality_name);
+
+        match self.client.extract_stream_url(&link).await {
+            Ok(direct_url) => {
+                self.is_loading = false;
+                let title = anime.title.clone();
+                self.record_history(anime, ep_session, ep_num.clone());
+                self.launch_mpv(terminal, &direct_url, &title, &ep_num).await?;
+                if let Some(prev) = self.previous_screen.take() {
+                    self.current_screen = prev;
                 }
+            }
+            Err(e) => {
+                self.is_loading = false;
+                self.temp_play_data = Some((anime, ep_session, ep_num));
+                self.status_message = format!("Failed to extract stream: {}", e);
             }
         }
         Ok(())
@@ -301,11 +350,13 @@ impl App {
         disable_raw_mode()?;
         terminal.show_cursor()?;
 
-        let mut mpv_cmd = Command::new("mpv");
-        mpv_cmd.arg("--referrer=https://kwik.cx/");
-        mpv_cmd.arg(format!("--title=Enuma - {} - Ep {}", title, ep));
-        
-        match mpv_cmd.arg(url).status() {
+        match Command::new("mpv")
+            .arg("--referrer=https://kwik.cx/")
+            .arg(format!("--title=Enuma - {} - Ep {}", title, ep))
+            .arg(url)
+            .status()
+            .await
+        {
             Ok(status) => {
                 if status.success() {
                     self.status_message = format!("Finished playing Ep {}.", ep);
@@ -391,20 +442,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                         _ => {}
                     },
                 CurrentScreen::SearchResults => match key.code {
-                    KeyCode::Up => {
-                        let i = match app.search_list_state.selected() {
-                            Some(i) => if i == 0 { app.search_results.len().saturating_sub(1) } else { i - 1 },
-                            None => 0,
-                        };
-                        app.search_list_state.select(Some(i));
-                    }
-                    KeyCode::Down => {
-                        let i = match app.search_list_state.selected() {
-                            Some(i) => if i >= app.search_results.len().saturating_sub(1) { 0 } else { i + 1 },
-                            None => 0,
-                        };
-                        app.search_list_state.select(Some(i));
-                    }
+                    KeyCode::Up => cycle_selection(&mut app.search_list_state, app.search_results.len(), true),
+                    KeyCode::Down => cycle_selection(&mut app.search_list_state, app.search_results.len(), false),
                     KeyCode::Char('f') => { app.toggle_library(); }
                     KeyCode::Char('/') => { 
                         app.is_searching = true; 
@@ -432,20 +471,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                     _ => {}
                 },
                 CurrentScreen::Library => match key.code {
-                    KeyCode::Up => {
-                        let i = match app.library_list_state.selected() {
-                            Some(i) => if i == 0 { app.library.len().saturating_sub(1) } else { i - 1 },
-                            None => 0,
-                        };
-                        app.library_list_state.select(Some(i));
-                    }
-                    KeyCode::Down => {
-                        let i = match app.library_list_state.selected() {
-                            Some(i) => if i >= app.library.len().saturating_sub(1) { 0 } else { i + 1 },
-                            None => 0,
-                        };
-                        app.library_list_state.select(Some(i));
-                    }
+                    KeyCode::Up => cycle_selection(&mut app.library_list_state, app.library.len(), true),
+                    KeyCode::Down => cycle_selection(&mut app.library_list_state, app.library.len(), false),
                     KeyCode::Char('f') => { app.toggle_library(); }
                     KeyCode::Char('/') => { 
                         app.is_searching = true;
@@ -467,20 +494,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                     _ => {}
                 },
                 CurrentScreen::History => match key.code {
-                    KeyCode::Up => {
-                        let i = match app.history_list_state.selected() {
-                            Some(i) => if i == 0 { app.history.len().saturating_sub(1) } else { i - 1 },
-                            None => 0,
-                        };
-                        app.history_list_state.select(Some(i));
-                    }
-                    KeyCode::Down => {
-                        let i = match app.history_list_state.selected() {
-                            Some(i) => if i >= app.history.len().saturating_sub(1) { 0 } else { i + 1 },
-                            None => 0,
-                        };
-                        app.history_list_state.select(Some(i));
-                    }
+                    KeyCode::Up => cycle_selection(&mut app.history_list_state, app.history.len(), true),
+                    KeyCode::Down => cycle_selection(&mut app.history_list_state, app.history.len(), false),
                     KeyCode::Char('f') => { app.toggle_library(); }
                     KeyCode::Char('/') => { 
                         app.is_searching = true;
@@ -509,20 +524,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                     _ => {}
                 },
                 CurrentScreen::EpisodeList => match key.code {
-                    KeyCode::Up => {
-                        let i = match app.episode_list_state.selected() {
-                            Some(i) => if i == 0 { app.episode_list.len().saturating_sub(1) } else { i - 1 },
-                            None => 0,
-                        };
-                        app.episode_list_state.select(Some(i));
-                    }
-                    KeyCode::Down => {
-                        let i = match app.episode_list_state.selected() {
-                            Some(i) => if i >= app.episode_list.len().saturating_sub(1) { 0 } else { i + 1 },
-                            None => 0,
-                        };
-                        app.episode_list_state.select(Some(i));
-                    }
+                    KeyCode::Up => cycle_selection(&mut app.episode_list_state, app.episode_list.len(), true),
+                    KeyCode::Down => cycle_selection(&mut app.episode_list_state, app.episode_list.len(), false),
                     KeyCode::Left => {
                         if app.ep_page > 1 {
                             app.load_episodes(app.ep_page - 1).await;
@@ -550,29 +553,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                     _ => {}
                 }
                 CurrentScreen::QualitySelection => match key.code {
-                    KeyCode::Up => {
-                        let i = match app.quality_list_state.selected() {
-                            Some(i) => if i == 0 { app.available_streams.len().saturating_sub(1) } else { i - 1 },
-                            None => 0,
-                        };
-                        app.quality_list_state.select(Some(i));
-                    }
-                    KeyCode::Down => {
-                        let i = match app.quality_list_state.selected() {
-                            Some(i) => if i >= app.available_streams.len().saturating_sub(1) { 0 } else { i + 1 },
-                            None => 0,
-                        };
-                        app.quality_list_state.select(Some(i));
-                    }
+                    KeyCode::Up => cycle_selection(&mut app.quality_list_state, app.available_streams.len(), true),
+                    KeyCode::Down => cycle_selection(&mut app.quality_list_state, app.available_streams.len(), false),
                     KeyCode::Enter => {
                         app.play_selected_stream(terminal).await?;
                     }
                     KeyCode::Esc => {
-                        if let Some(prev) = app.previous_screen.clone() {
-                            app.current_screen = prev;
-                        } else {
-                            app.current_screen = CurrentScreen::EpisodeList;
-                        }
+                        app.current_screen = app.previous_screen.take()
+                            .unwrap_or(CurrentScreen::EpisodeList);
                     }
                     _ => {}
                 }
@@ -605,6 +593,9 @@ fn ui(f: &mut Frame, app: &mut App) {
             .border_style(Style::default().fg(if app.is_searching { Color::Yellow } else if app.current_screen == CurrentScreen::Search { Color::Cyan } else { Color::White })));
     f.render_widget(search_block, chunks[0]);
 
+    // Build library session set once for O(1) lookups in render
+    let lib_sessions: HashSet<&str> = app.library.iter().map(|a| a.session.as_str()).collect();
+
     // Main Content
     if app.is_loading {
         render_loading_animation(f, chunks[1], app.animation_tick);
@@ -618,7 +609,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             f.render_widget(welcome, chunks[1]);
         }
         CurrentScreen::SearchResults => {
-            render_anime_list(f, chunks[1], &app.search_results, &mut app.search_list_state, &app.library, " Results ");
+            render_anime_list(f, chunks[1], &app.search_results, &mut app.search_list_state, &lib_sessions, " Results ");
         }
         CurrentScreen::Library => {
             if app.library.is_empty() {
@@ -627,7 +618,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                     .style(Style::default().fg(Color::Yellow));
                 f.render_widget(empty, chunks[1]);
             } else {
-                render_anime_list(f, chunks[1], &app.library, &mut app.library_list_state, &app.library, " Library ");
+                render_anime_list(f, chunks[1], &app.library, &mut app.library_list_state, &lib_sessions, " Library ");
             }
         }
         CurrentScreen::History => {
@@ -637,7 +628,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                     .style(Style::default().fg(Color::Yellow));
                 f.render_widget(empty, chunks[1]);
             } else {
-                render_history_list(f, chunks[1], &app.history, &mut app.history_list_state, &app.library);
+                render_history_list(f, chunks[1], &app.history, &mut app.history_list_state, &lib_sessions);
             }
         }
         CurrentScreen::EpisodeList => {
@@ -688,7 +679,7 @@ fn render_loading_animation(f: &mut Frame, area: Rect, tick: u32) {
     f.render_widget(status, chunks[2]);
 }
 
-fn render_anime_list(f: &mut Frame, area: Rect, list_data: &[Anime], state: &mut ListState, library: &[Anime], title: &str) {
+fn render_anime_list(f: &mut Frame, area: Rect, list_data: &[Anime], state: &mut ListState, lib_sessions: &HashSet<&str>, title: &str) {
     let layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -697,28 +688,28 @@ fn render_anime_list(f: &mut Frame, area: Rect, list_data: &[Anime], state: &mut
     let items: Vec<ListItem> = list_data
         .iter()
         .map(|i| {
-            let lib_mark = if library.iter().any(|f| f.session == i.session) { "❤ " } else { "  " };
-            let title = if i.title.len() > 40 { format!("{}...", &i.title[..37]) } else { i.title.clone() };
+            let lib_mark = if lib_sessions.contains(i.session.as_str()) { "❤ " } else { "  " };
+            let title = truncate_str(&i.title, 37);
             ListItem::new(format!("{}{}", lib_mark, title))
         })
         .collect();
-    
+
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(Color::Cyan)))
         .highlight_style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))
         .highlight_symbol("▶ ");
-    
+
     f.render_stateful_widget(list, layout[0], state);
 
     // Details Panel
     if let Some(i) = state.selected() {
         if let Some(anime) = list_data.get(i) {
-            render_details(f, layout[1], anime, library);
+            render_details(f, layout[1], anime, lib_sessions);
         }
     }
 }
 
-fn render_history_list(f: &mut Frame, area: Rect, list_data: &[HistoryItem], state: &mut ListState, library: &[Anime]) {
+fn render_history_list(f: &mut Frame, area: Rect, list_data: &[HistoryItem], state: &mut ListState, lib_sessions: &HashSet<&str>) {
     let layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -727,28 +718,28 @@ fn render_history_list(f: &mut Frame, area: Rect, list_data: &[HistoryItem], sta
     let items: Vec<ListItem> = list_data
         .iter()
         .map(|h| {
-            let lib_mark = if library.iter().any(|f| f.session == h.anime.session) { "❤ " } else { "  " };
-            let title = if h.anime.title.len() > 30 { format!("{}...", &h.anime.title[..27]) } else { h.anime.title.clone() };
+            let lib_mark = if lib_sessions.contains(h.anime.session.as_str()) { "❤ " } else { "  " };
+            let title = truncate_str(&h.anime.title, 27);
             ListItem::new(format!("{}{:<35} Ep {:<3} [{}]", lib_mark, title, h.last_episode, h.last_watched))
         })
         .collect();
-    
+
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(" History ").border_style(Style::default().fg(Color::Cyan)))
         .highlight_style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))
         .highlight_symbol("▶ ");
-    
+
     f.render_stateful_widget(list, layout[0], state);
 
     if let Some(i) = state.selected() {
         if let Some(item) = list_data.get(i) {
-            render_details(f, layout[1], &item.anime, library);
+            render_details(f, layout[1], &item.anime, lib_sessions);
         }
     }
 }
 
-fn render_details(f: &mut Frame, area: Rect, anime: &Anime, library: &[Anime]) {
-    let is_lib = library.iter().any(|f| f.session == anime.session);
+fn render_details(f: &mut Frame, area: Rect, anime: &Anime, lib_sessions: &HashSet<&str>) {
+    let is_lib = lib_sessions.contains(anime.session.as_str());
     let details = format!(
         "Title: {}\n\nType: {}\nStatus: {}\nEpisodes: {}\nScore: {}\nYear: {}\n\n{}",
         anime.title,

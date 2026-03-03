@@ -56,7 +56,7 @@ pub struct StreamItem {
 
 pub struct AnimeClient {
     client: reqwest::Client,
-    base_url: String,
+    base_url: &'static str,
 }
 
 impl AnimeClient {
@@ -73,29 +73,26 @@ impl AnimeClient {
 
         Ok(Self {
             client,
-            base_url: "https://anime.apex-cloud.workers.dev".to_string(),
+            base_url: "https://anime.apex-cloud.workers.dev",
         })
     }
 
     pub async fn search(&self, query: &str) -> Result<SearchResponse> {
-        let url = format!("{}/?method=search&query={}", self.base_url, query);
+        let url = format!("{}/?method=search&query={}", self.base_url, urlencoding::encode(query));
         let resp = self.client.get(&url).send().await?;
-        let text = resp.text().await?;
-        serde_json::from_str(&text).context("Failed to parse search response")
+        resp.json::<SearchResponse>().await.context("Failed to parse search response")
     }
 
     pub async fn get_episodes(&self, session: &str, page: u32) -> Result<SeriesResponse> {
-        let url = format!("{}/?method=series&session={}&page={}", self.base_url, session, page);
+        let url = format!("{}/?method=series&session={}&page={}", self.base_url, urlencoding::encode(session), page);
         let resp = self.client.get(&url).send().await?;
-        let text = resp.text().await?;
-        serde_json::from_str(&text).context("Failed to parse episodes response")
+        resp.json::<SeriesResponse>().await.context("Failed to parse episodes response")
     }
 
     pub async fn get_stream(&self, series_session: &str, episode_session: &str) -> Result<Vec<StreamItem>> {
-        let url = format!("{}/?method=episode&session={}&ep={}", self.base_url, series_session, episode_session);
+        let url = format!("{}/?method=episode&session={}&ep={}", self.base_url, urlencoding::encode(series_session), urlencoding::encode(episode_session));
         let resp = self.client.get(&url).send().await?;
-        let text = resp.text().await?;
-        serde_json::from_str(&text).context("Failed to parse stream response")
+        resp.json::<Vec<StreamItem>>().await.context("Failed to parse stream response")
     }
 
     pub async fn extract_stream_url(&self, kwik_url: &str) -> Result<String> {
