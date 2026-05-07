@@ -56,6 +56,43 @@ fn kwik_cookie_header(
     }
 }
 
+/// Parse FlareSolverr `v1` JSON body after a successful `request.get`.
+fn parse_flare_solve_response(
+    body: &serde_json::Value,
+    http_status: reqwest::StatusCode,
+) -> Result<(String, Option<String>)> {
+    if body["status"].as_str() != Some("ok") {
+        let msg = body["message"]
+            .as_str()
+            .or_else(|| body["error"].as_str())
+            .unwrap_or("unknown error");
+        bail!("FlareSolverr error (HTTP {http_status}): {msg}");
+    }
+
+    let solution = &body["solution"];
+    let html = solution["response"]
+        .as_str()
+        .or_else(|| solution["body"].as_str())
+        .context("FlareSolverr: solution.response missing")?
+        .to_string();
+
+    let cookie_line: Option<String> = solution["cookies"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let name = c["name"].as_str()?;
+                    let value = c["value"].as_str()?;
+                    Some(format!("{name}={value}"))
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .filter(|s| !s.trim().is_empty());
+
+    Ok((html, cookie_line))
+}
+
 /// Call a local [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) instance (same idea as
 /// outsourcing Cloudflare to a headless browser, similar to how Node stacks combine `cloudscraper`
 /// with real browser sessions when needed).
@@ -83,36 +120,63 @@ async fn flare_solve_get(
         .await
         .context("FlareSolverr: response was not JSON")?;
 
-    if body["status"].as_str() != Some("ok") {
-        let msg = body["message"]
-            .as_str()
-            .or_else(|| body["error"].as_str())
-            .unwrap_or("unknown error");
-        bail!("FlareSolverr error (HTTP {status}): {msg}");
+    parse_flare_solve_response(&body, status)
+}
+
+#[cfg(test)]
+mod flare_tests {
+    use super::*;
+
+    #[test]
+    fn parse_flare_ok_with_cookies() {
+        let body = serde_json::json!({
+            "status": "ok",
+            "solution": {
+                "response": "<html><title>ok</title></html>",
+                "cookies": [
+                    {"name": "cf_clearance", "value": "abc", "domain": ".kwik.cx"},
+                    {"name": "sid", "value": "xyz", "domain": "kwik.cx"}
+                ]
+            }
+        });
+        let (html, cookies) =
+            parse_flare_solve_response(&body, reqwest::StatusCode::OK).expect("parse");
+        assert!(html.contains("ok"));
+        assert_eq!(cookies.as_deref(), Some("cf_clearance=abc; sid=xyz"));
     }
 
-    let solution = &body["solution"];
-    let html = solution["response"]
-        .as_str()
-        .or_else(|| solution["body"].as_str())
-        .context("FlareSolverr: solution.response missing")?
-        .to_string();
+    #[test]
+    fn parse_flare_ok_body_instead_of_response() {
+        let body = serde_json::json!({
+            "status": "ok",
+            "solution": {
+                "body": "<html></html>"
+            }
+        });
+        let (html, cookies) =
+            parse_flare_solve_response(&body, reqwest::StatusCode::OK).expect("parse");
+        assert_eq!(html, "<html></html>");
+        assert!(cookies.is_none());
+    }
 
-    let cookie_line: Option<String> = solution["cookies"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|c| {
-                    let name = c["name"].as_str()?;
-                    let value = c["value"].as_str()?;
-                    Some(format!("{name}={value}"))
-                })
-                .collect::<Vec<_>>()
-                .join("; ")
-        })
-        .filter(|s| !s.trim().is_empty());
+    #[test]
+    fn parse_flare_error_status() {
+        let body = serde_json::json!({
+            "status": "error",
+            "message": "timeout"
+        });
+        let err = parse_flare_solve_response(&body, reqwest::StatusCode::OK).unwrap_err();
+        assert!(err.to_string().contains("timeout"));
+    }
 
-    Ok((html, cookie_line))
+    #[test]
+    fn merge_cookie_headers_joins() {
+        assert_eq!(
+            merge_cookie_headers(Some("a=1"), Some("b=2")).as_deref(),
+            Some("a=1; b=2")
+        );
+        assert!(merge_cookie_headers(None, None).is_none());
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
