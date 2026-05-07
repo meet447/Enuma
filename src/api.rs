@@ -28,6 +28,93 @@ static WINDOW_LOC_RE: OnceLock<Regex> = OnceLock::new();
 
 const KWIK_ORIGIN: &str = "https://kwik.cx";
 
+/// Merge two `Cookie` header values (e.g. manual `ENUMA_KWIK_COOKIES` + FlareSolverr cookies).
+fn merge_cookie_headers(a: Option<&str>, b: Option<&str>) -> Option<String> {
+    let parts: Vec<&str> = [a, b]
+        .into_iter()
+        .flatten()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
+}
+
+fn kwik_cookie_header(
+    req: reqwest::RequestBuilder,
+    cookies: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let Some(c) = cookies.map(|s| s.trim()).filter(|c| !c.is_empty()) else {
+        return req;
+    };
+    match HeaderValue::from_str(c) {
+        Ok(hv) => req.header(COOKIE, hv),
+        Err(_) => req,
+    }
+}
+
+/// Call a local [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) instance (same idea as
+/// outsourcing Cloudflare to a headless browser, similar to how Node stacks combine `cloudscraper`
+/// with real browser sessions when needed).
+async fn flare_solve_get(
+    http: &reqwest::Client,
+    flare_base: &str,
+    target_url: &str,
+) -> Result<(String, Option<String>)> {
+    let endpoint = format!("{}/v1", flare_base.trim_end_matches('/'));
+    let payload = serde_json::json!({
+        "cmd": "request.get",
+        "url": target_url,
+        "maxTimeout": 180000,
+    });
+    let resp = http
+        .post(endpoint)
+        .json(&payload)
+        .timeout(Duration::from_secs(190))
+        .send()
+        .await
+        .context("FlareSolverr: could not reach service (is it running?)")?;
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .context("FlareSolverr: response was not JSON")?;
+
+    if body["status"].as_str() != Some("ok") {
+        let msg = body["message"]
+            .as_str()
+            .or_else(|| body["error"].as_str())
+            .unwrap_or("unknown error");
+        bail!("FlareSolverr error (HTTP {status}): {msg}");
+    }
+
+    let solution = &body["solution"];
+    let html = solution["response"]
+        .as_str()
+        .or_else(|| solution["body"].as_str())
+        .context("FlareSolverr: solution.response missing")?
+        .to_string();
+
+    let cookie_line: Option<String> = solution["cookies"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let name = c["name"].as_str()?;
+                    let value = c["value"].as_str()?;
+                    Some(format!("{name}={value}"))
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .filter(|s| !s.trim().is_empty());
+
+    Ok((html, cookie_line))
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SearchResponse {
     pub data: Vec<Anime>,
@@ -116,15 +203,6 @@ impl AnimeClient {
         );
         headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
 
-        if let Ok(cookie_raw) = std::env::var("ENUMA_KWIK_COOKIES") {
-            let trimmed = cookie_raw.trim();
-            if !trimmed.is_empty() {
-                let hv = HeaderValue::from_str(trimmed)
-                    .context("ENUMA_KWIK_COOKIES: invalid header value")?;
-                headers.insert(COOKIE, hv);
-            }
-        }
-
         reqwest::Client::builder()
             .default_headers(headers)
             .cookie_store(true)
@@ -183,48 +261,73 @@ impl AnimeClient {
             .map(|m| m.as_str())
             .context("Could not extract slug from kwik URL")?;
 
-        let f_page = self
-            .kwik_client
-            .get(kwik_url)
-            .header(REFERER, HeaderValue::from_static(KWIK_ORIGIN))
+        let env_cookie = std::env::var("ENUMA_KWIK_COOKIES")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let mut cookie_header: Option<String> = env_cookie;
+
+        let f_page = if let Ok(flare_raw) = std::env::var("ENUMA_KWIK_FLARESOLVERR_URL") {
+            let flare_base = flare_raw.trim().trim_end_matches('/').to_string();
+            let (html, from_flare) = flare_solve_get(&self.client, &flare_base, kwik_url)
+                .await
+                .context("FlareSolverr (ENUMA_KWIK_FLARESOLVERR_URL) failed")?;
+            cookie_header = merge_cookie_headers(cookie_header.as_deref(), from_flare.as_deref());
+            html
+        } else {
+            let cookies = cookie_header.as_deref();
+            kwik_cookie_header(
+                self.kwik_client
+                    .get(kwik_url)
+                    .header(REFERER, HeaderValue::from_static(KWIK_ORIGIN)),
+                cookies,
+            )
             .send()
             .await?
             .text()
-            .await?;
+            .await?
+        };
+
+        let cookies = cookie_header.as_deref();
 
         if is_cloudflare_interstitial(&f_page) {
             bail!(
-                "kwik.cx returned a Cloudflare challenge (no real embed page). \
-                 Open the stream link in a browser, copy your Cookie header for kwik.cx \
-                 (including cf_clearance if present), then export it as ENUMA_KWIK_COOKIES \
-                 and try again."
+                "kwik.cx returned a Cloudflare challenge (no real embed page). Options: \
+                 (1) Set ENUMA_KWIK_COOKIES to your browser Cookie string for kwik.cx (include cf_clearance if present); \
+                 (2) Run [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) locally and set ENUMA_KWIK_FLARESOLVERR_URL to its base URL (e.g. http://127.0.0.1:8191)."
             );
         }
 
-        if let Ok(direct) = self.try_kwik_form_post(kwik_url, &f_page).await {
+        if let Ok(direct) = self.try_kwik_form_post(kwik_url, &f_page, cookies).await {
             return Ok(direct);
         }
 
         let embed_path = self.decode_kwik_f_page(&f_page)?;
         let embed_page_url = resolve_against(kwik_url, &embed_path)?;
-        let e_page = self
-            .kwik_client
-            .get(&embed_page_url)
-            .header(
+        let e_page = kwik_cookie_header(
+            self.kwik_client.get(&embed_page_url).header(
                 REFERER,
                 HeaderValue::from_str(kwik_url).unwrap_or(HeaderValue::from_static(KWIK_ORIGIN)),
-            )
-            .send()
-            .await?
-            .text()
-            .await?;
+            ),
+            cookies,
+        )
+        .send()
+        .await?
+        .text()
+        .await?;
 
         self.decode_kwik_embed_page(&e_page)
     }
 
     /// Matches [animepahe-api](https://github.com/ElijahCodes12345/animepahe-api) `getKwikDownloadUrl`:
     /// POST `_token` to the form action, then follow `Location` or parse the response body.
-    async fn try_kwik_form_post(&self, page_url: &str, html: &str) -> Result<String> {
+    async fn try_kwik_form_post(
+        &self,
+        page_url: &str,
+        html: &str,
+        cookies: Option<&str>,
+    ) -> Result<String> {
         let Some((action, token)) = extract_kwik_form(html) else {
             bail!("no kwik form on page");
         };
@@ -233,17 +336,20 @@ impl AnimeClient {
 
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        let resp = self
-            .kwik_client
-            .post(&post_url)
-            .header(
-                REFERER,
-                HeaderValue::from_str(page_url).unwrap_or(HeaderValue::from_static(KWIK_ORIGIN)),
-            )
-            .header(ORIGIN, HeaderValue::from_static(KWIK_ORIGIN))
-            .form(&[("_token", token.as_str())])
-            .send()
-            .await?;
+        let resp = kwik_cookie_header(
+            self.kwik_client
+                .post(&post_url)
+                .header(
+                    REFERER,
+                    HeaderValue::from_str(page_url)
+                        .unwrap_or(HeaderValue::from_static(KWIK_ORIGIN)),
+                )
+                .header(ORIGIN, HeaderValue::from_static(KWIK_ORIGIN))
+                .form(&[("_token", token.as_str())]),
+            cookies,
+        )
+        .send()
+        .await?;
 
         let status = resp.status();
 
@@ -261,18 +367,18 @@ impl AnimeClient {
                 if target.contains(".m3u8") {
                     return Ok(target);
                 }
-                let body = self
-                    .kwik_client
-                    .get(&target)
-                    .header(
+                let body = kwik_cookie_header(
+                    self.kwik_client.get(&target).header(
                         REFERER,
                         HeaderValue::from_str(page_url)
                             .unwrap_or(HeaderValue::from_static(KWIK_ORIGIN)),
-                    )
-                    .send()
-                    .await?
-                    .text()
-                    .await?;
+                    ),
+                    cookies,
+                )
+                .send()
+                .await?
+                .text()
+                .await?;
                 return self.decode_kwik_embed_page(&body);
             }
         }
@@ -284,18 +390,18 @@ impl AnimeClient {
                 if target.contains(".m3u8") {
                     return Ok(target);
                 }
-                let inner = self
-                    .kwik_client
-                    .get(&target)
-                    .header(
+                let inner = kwik_cookie_header(
+                    self.kwik_client.get(&target).header(
                         REFERER,
                         HeaderValue::from_str(page_url)
                             .unwrap_or(HeaderValue::from_static(KWIK_ORIGIN)),
-                    )
-                    .send()
-                    .await?
-                    .text()
-                    .await?;
+                    ),
+                    cookies,
+                )
+                .send()
+                .await?
+                .text()
+                .await?;
                 return self.decode_kwik_embed_page(&inner);
             }
         }
