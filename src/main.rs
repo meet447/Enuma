@@ -1,7 +1,7 @@
 mod api;
 
 use anyhow::Result;
-use api::{AnimeClient, Anime, Episode, StreamItem};
+use api::{Anime, AnimeClient, Episode, StreamItem};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -14,12 +14,11 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use tokio::process::Command;
-use serde::{Deserialize, Serialize};
-use chrono;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct HistoryItem {
@@ -43,11 +42,11 @@ struct App {
     client: AnimeClient,
     current_screen: CurrentScreen,
     search_query: String,
-    
+
     // Search Results
     search_results: Vec<Anime>,
     search_list_state: ListState,
-    
+
     // Episode List
     selected_anime: Option<Anime>,
     episode_list: Vec<Episode>,
@@ -84,8 +83,16 @@ fn cycle_selection(state: &mut ListState, len: usize, up: bool) {
     let i = match state.selected() {
         Some(i) => {
             if up {
-                if i == 0 { len.saturating_sub(1) } else { i - 1 }
-            } else if i >= len.saturating_sub(1) { 0 } else { i + 1 }
+                if i == 0 {
+                    len.saturating_sub(1)
+                } else {
+                    i - 1
+                }
+            } else if i >= len.saturating_sub(1) {
+                0
+            } else {
+                i + 1
+            }
         }
         None => 0,
     };
@@ -160,25 +167,27 @@ impl App {
 
     fn toggle_library(&mut self) {
         let session = match self.current_screen {
-            CurrentScreen::SearchResults => {
-                self.search_list_state.selected()
-                    .and_then(|i| self.search_results.get(i))
-                    .map(|a| a.session.as_str())
-            }
-            CurrentScreen::Library => {
-                self.library_list_state.selected()
-                    .and_then(|i| self.library.get(i))
-                    .map(|a| a.session.as_str())
-            }
-            CurrentScreen::History => {
-                self.history_list_state.selected()
-                    .and_then(|i| self.history.get(i))
-                    .map(|h| h.anime.session.as_str())
-            }
+            CurrentScreen::SearchResults => self
+                .search_list_state
+                .selected()
+                .and_then(|i| self.search_results.get(i))
+                .map(|a| a.session.as_str()),
+            CurrentScreen::Library => self
+                .library_list_state
+                .selected()
+                .and_then(|i| self.library.get(i))
+                .map(|a| a.session.as_str()),
+            CurrentScreen::History => self
+                .history_list_state
+                .selected()
+                .and_then(|i| self.history.get(i))
+                .map(|h| h.anime.session.as_str()),
             _ => None,
         };
 
-        let Some(session) = session.map(String::from) else { return };
+        let Some(session) = session.map(String::from) else {
+            return;
+        };
 
         if let Some(pos) = self.library.iter().position(|f| f.session == session) {
             let title = self.library[pos].title.clone();
@@ -186,14 +195,14 @@ impl App {
             self.status_message = format!("Removed '{}' from library", title);
         } else {
             let anime = match self.current_screen {
-                CurrentScreen::SearchResults => {
-                    self.search_list_state.selected()
-                        .and_then(|i| self.search_results.get(i).cloned())
-                }
-                CurrentScreen::History => {
-                    self.history_list_state.selected()
-                        .and_then(|i| self.history.get(i).map(|h| h.anime.clone()))
-                }
+                CurrentScreen::SearchResults => self
+                    .search_list_state
+                    .selected()
+                    .and_then(|i| self.search_results.get(i).cloned()),
+                CurrentScreen::History => self
+                    .history_list_state
+                    .selected()
+                    .and_then(|i| self.history.get(i).map(|h| h.anime.clone())),
                 _ => None,
             };
             if let Some(anime) = anime {
@@ -206,30 +215,37 @@ impl App {
 
     fn record_history(&mut self, anime: Anime, ep_session: String, ep_num: String) {
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
-        
-        if let Some(pos) = self.history.iter().position(|h| h.anime.session == anime.session) {
+
+        if let Some(pos) = self
+            .history
+            .iter()
+            .position(|h| h.anime.session == anime.session)
+        {
             self.history.remove(pos);
         }
-        
-        self.history.insert(0, HistoryItem {
-            anime,
-            episode_session: ep_session,
-            last_episode: ep_num,
-            last_watched: now,
-        });
-        
+
+        self.history.insert(
+            0,
+            HistoryItem {
+                anime,
+                episode_session: ep_session,
+                last_episode: ep_num,
+                last_watched: now,
+            },
+        );
+
         // Keep only top 50
         if self.history.len() > 50 {
             self.history.truncate(50);
         }
-        
+
         let _ = Self::save_data("history.json", &self.history);
     }
 
     async fn perform_search(&mut self) {
-        if self.search_query.is_empty() { 
+        if self.search_query.is_empty() {
             self.is_searching = false;
-            return; 
+            return;
         }
         self.is_loading = true;
         self.status_message = "Searching...".to_string();
@@ -240,7 +256,10 @@ impl App {
                 self.search_results = res.data;
                 self.current_screen = CurrentScreen::SearchResults;
                 self.search_list_state.select(Some(0));
-                self.status_message = format!("Found {} results. 'f' to add to library, Enter to view.", self.search_results.len());
+                self.status_message = format!(
+                    "Found {} results. 'f' to add to library, Enter to view.",
+                    self.search_results.len()
+                );
             }
             Err(e) => {
                 self.is_loading = false;
@@ -262,7 +281,10 @@ impl App {
                     self.ep_total_pages = res.total_pages;
                     self.current_screen = CurrentScreen::EpisodeList;
                     self.episode_list_state.select(Some(0));
-                    self.status_message = format!("Page {}/{}. Left/Right for pages. Enter to play.", self.ep_page, self.ep_total_pages);
+                    self.status_message = format!(
+                        "Page {}/{}. Left/Right for pages. Enter to play.",
+                        self.ep_page, self.ep_total_pages
+                    );
                 }
                 Err(e) => {
                     self.is_loading = false;
@@ -273,17 +295,27 @@ impl App {
     }
 
     async fn play_episode(&mut self) -> Result<()> {
-        let Some(i) = self.episode_list_state.selected() else { return Ok(()) };
-        let Some(ep) = self.episode_list.get(i) else { return Ok(()) };
+        let Some(i) = self.episode_list_state.selected() else {
+            return Ok(());
+        };
+        let Some(ep) = self.episode_list.get(i) else {
+            return Ok(());
+        };
         let ep_session = ep.session.clone();
         let ep_num = ep.episode.clone();
         if let Some(anime) = self.selected_anime.clone() {
-            self.prepare_stream_selection(anime, ep_session, ep_num).await?;
+            self.prepare_stream_selection(anime, ep_session, ep_num)
+                .await?;
         }
         Ok(())
     }
 
-    async fn prepare_stream_selection(&mut self, anime: Anime, ep_session: String, ep_num: String) -> Result<()> {
+    async fn prepare_stream_selection(
+        &mut self,
+        anime: Anime,
+        ep_session: String,
+        ep_num: String,
+    ) -> Result<()> {
         self.is_loading = true;
         self.status_message = format!("Fetching streams for Ep {}...", ep_num);
         let series_session = anime.session.clone();
@@ -296,25 +328,33 @@ impl App {
                     self.status_message = "No streams found.".to_string();
                     return Ok(());
                 }
-                
+
                 self.available_streams = streams;
                 self.quality_list_state.select(Some(0));
                 self.temp_play_data = Some((anime, ep_session, ep_num));
                 self.previous_screen = Some(self.current_screen.clone());
                 self.current_screen = CurrentScreen::QualitySelection;
-                self.status_message = "Select video quality. Enter to play, Esc to go back.".to_string();
+                self.status_message =
+                    "Select video quality. Enter to play, Esc to go back.".to_string();
             }
             Err(e) => {
-                 self.is_loading = false;
-                 self.status_message = format!("Error fetching stream: {}", e);
+                self.is_loading = false;
+                self.status_message = format!("Error fetching stream: {}", e);
             }
         }
         Ok(())
     }
 
-    async fn play_selected_stream(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-        let Some(idx) = self.quality_list_state.selected() else { return Ok(()) };
-        let Some((anime, ep_session, ep_num)) = self.temp_play_data.take() else { return Ok(()) };
+    async fn play_selected_stream(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<()> {
+        let Some(idx) = self.quality_list_state.selected() else {
+            return Ok(());
+        };
+        let Some((anime, ep_session, ep_num)) = self.temp_play_data.take() else {
+            return Ok(());
+        };
         let Some(link_item) = self.available_streams.get(idx) else {
             self.temp_play_data = Some((anime, ep_session, ep_num));
             return Ok(());
@@ -331,7 +371,8 @@ impl App {
                 self.is_loading = false;
                 let title = anime.title.clone();
                 self.record_history(anime, ep_session, ep_num.clone());
-                self.launch_mpv(terminal, &direct_url, &title, &ep_num).await?;
+                self.launch_mpv(terminal, &direct_url, &title, &ep_num)
+                    .await?;
                 if let Some(prev) = self.previous_screen.take() {
                     self.current_screen = prev;
                 }
@@ -345,8 +386,18 @@ impl App {
         Ok(())
     }
 
-    async fn launch_mpv(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>, url: &str, title: &str, ep: &str) -> Result<()> {
-        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    async fn launch_mpv(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        url: &str,
+        title: &str,
+        ep: &str,
+    ) -> Result<()> {
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )?;
         disable_raw_mode()?;
         terminal.show_cursor()?;
 
@@ -363,14 +414,18 @@ impl App {
                 } else {
                     self.status_message = format!("mpv exited with status: {}", status);
                 }
-            },
+            }
             Err(e) => {
                 self.status_message = format!("Failed to launch mpv: {}. Is it installed?", e);
             }
         }
 
         enable_raw_mode()?;
-        execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(
+            terminal.backend_mut(),
+            EnterAlternateScreen,
+            EnableMouseCapture
+        )?;
         terminal.hide_cursor()?;
         terminal.clear()?;
         Ok(())
@@ -415,10 +470,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
             if let Event::Key(key) = event::read()? {
                 if app.is_searching {
                     match key.code {
-                        KeyCode::Enter => { app.perform_search().await; }
-                        KeyCode::Esc => { app.is_searching = false; }
-                        KeyCode::Backspace => { app.search_query.pop(); }
-                        KeyCode::Char(c) => { app.search_query.push(c); }
+                        KeyCode::Enter => {
+                            app.perform_search().await;
+                        }
+                        KeyCode::Esc => {
+                            app.is_searching = false;
+                        }
+                        KeyCode::Backspace => {
+                            app.search_query.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            app.search_query.push(c);
+                        }
                         _ => {}
                     }
                     continue;
@@ -441,132 +504,177 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                         KeyCode::Esc => return Ok(()),
                         _ => {}
                     },
-                CurrentScreen::SearchResults => match key.code {
-                    KeyCode::Up => cycle_selection(&mut app.search_list_state, app.search_results.len(), true),
-                    KeyCode::Down => cycle_selection(&mut app.search_list_state, app.search_results.len(), false),
-                    KeyCode::Char('f') => { app.toggle_library(); }
-                    KeyCode::Char('/') => { 
-                        app.is_searching = true; 
-                        app.search_query.clear();
-                    }
-                    KeyCode::Char('l') => {
-                        app.current_screen = CurrentScreen::Library;
-                        app.library_list_state.select(Some(0));
-                    }
-                    KeyCode::Char('h') => {
-                        app.current_screen = CurrentScreen::History;
-                        app.history_list_state.select(Some(0));
-                    }
-                    KeyCode::Enter => {
-                        if let Some(i) = app.search_list_state.selected() {
-                            if let Some(anime) = app.search_results.get(i).cloned() {
-                                app.selected_anime = Some(anime);
-                                app.load_episodes(1).await;
+                    CurrentScreen::SearchResults => match key.code {
+                        KeyCode::Up => cycle_selection(
+                            &mut app.search_list_state,
+                            app.search_results.len(),
+                            true,
+                        ),
+                        KeyCode::Down => cycle_selection(
+                            &mut app.search_list_state,
+                            app.search_results.len(),
+                            false,
+                        ),
+                        KeyCode::Char('f') => {
+                            app.toggle_library();
+                        }
+                        KeyCode::Char('/') => {
+                            app.is_searching = true;
+                            app.search_query.clear();
+                        }
+                        KeyCode::Char('l') => {
+                            app.current_screen = CurrentScreen::Library;
+                            app.library_list_state.select(Some(0));
+                        }
+                        KeyCode::Char('h') => {
+                            app.current_screen = CurrentScreen::History;
+                            app.history_list_state.select(Some(0));
+                        }
+                        KeyCode::Enter => {
+                            if let Some(i) = app.search_list_state.selected() {
+                                if let Some(anime) = app.search_results.get(i).cloned() {
+                                    app.selected_anime = Some(anime);
+                                    app.load_episodes(1).await;
+                                }
                             }
                         }
-                    }
-                    KeyCode::Esc => {
-                        app.current_screen = CurrentScreen::Search;
-                    }
-                    _ => {}
-                },
-                CurrentScreen::Library => match key.code {
-                    KeyCode::Up => cycle_selection(&mut app.library_list_state, app.library.len(), true),
-                    KeyCode::Down => cycle_selection(&mut app.library_list_state, app.library.len(), false),
-                    KeyCode::Char('f') => { app.toggle_library(); }
-                    KeyCode::Char('/') => { 
-                        app.is_searching = true;
-                        app.search_query.clear();
-                    }
-                    KeyCode::Char('h') => {
-                        app.current_screen = CurrentScreen::History;
-                        app.history_list_state.select(Some(0));
-                    }
-                    KeyCode::Enter => {
-                        if let Some(i) = app.library_list_state.selected() {
-                            if let Some(anime) = app.library.get(i).cloned() {
-                                app.selected_anime = Some(anime);
-                                app.load_episodes(1).await;
+                        KeyCode::Esc => {
+                            app.current_screen = CurrentScreen::Search;
+                        }
+                        _ => {}
+                    },
+                    CurrentScreen::Library => match key.code {
+                        KeyCode::Up => {
+                            cycle_selection(&mut app.library_list_state, app.library.len(), true)
+                        }
+                        KeyCode::Down => {
+                            cycle_selection(&mut app.library_list_state, app.library.len(), false)
+                        }
+                        KeyCode::Char('f') => {
+                            app.toggle_library();
+                        }
+                        KeyCode::Char('/') => {
+                            app.is_searching = true;
+                            app.search_query.clear();
+                        }
+                        KeyCode::Char('h') => {
+                            app.current_screen = CurrentScreen::History;
+                            app.history_list_state.select(Some(0));
+                        }
+                        KeyCode::Enter => {
+                            if let Some(i) = app.library_list_state.selected() {
+                                if let Some(anime) = app.library.get(i).cloned() {
+                                    app.selected_anime = Some(anime);
+                                    app.load_episodes(1).await;
+                                }
                             }
                         }
-                    }
-                    KeyCode::Esc => { app.current_screen = CurrentScreen::Search; }
-                    _ => {}
-                },
-                CurrentScreen::History => match key.code {
-                    KeyCode::Up => cycle_selection(&mut app.history_list_state, app.history.len(), true),
-                    KeyCode::Down => cycle_selection(&mut app.history_list_state, app.history.len(), false),
-                    KeyCode::Char('f') => { app.toggle_library(); }
-                    KeyCode::Char('/') => { 
-                        app.is_searching = true;
-                        app.search_query.clear();
-                    }
-                    KeyCode::Char('l') => {
-                        app.current_screen = CurrentScreen::Library;
-                        app.library_list_state.select(Some(0));
-                    }
-                    KeyCode::Char('e') => {
-                        if let Some(i) = app.history_list_state.selected() {
-                            if let Some(item) = app.history.get(i).cloned() {
-                                app.selected_anime = Some(item.anime);
-                                app.load_episodes(1).await;
+                        KeyCode::Esc => {
+                            app.current_screen = CurrentScreen::Search;
+                        }
+                        _ => {}
+                    },
+                    CurrentScreen::History => match key.code {
+                        KeyCode::Up => {
+                            cycle_selection(&mut app.history_list_state, app.history.len(), true)
+                        }
+                        KeyCode::Down => {
+                            cycle_selection(&mut app.history_list_state, app.history.len(), false)
+                        }
+                        KeyCode::Char('f') => {
+                            app.toggle_library();
+                        }
+                        KeyCode::Char('/') => {
+                            app.is_searching = true;
+                            app.search_query.clear();
+                        }
+                        KeyCode::Char('l') => {
+                            app.current_screen = CurrentScreen::Library;
+                            app.library_list_state.select(Some(0));
+                        }
+                        KeyCode::Char('e') => {
+                            if let Some(i) = app.history_list_state.selected() {
+                                if let Some(item) = app.history.get(i).cloned() {
+                                    app.selected_anime = Some(item.anime);
+                                    app.load_episodes(1).await;
+                                }
                             }
                         }
-                    }
-                    KeyCode::Enter => {
-                        if let Some(i) = app.history_list_state.selected() {
-                            if let Some(item) = app.history.get(i).cloned() {
-                                app.prepare_stream_selection(item.anime, item.episode_session, item.last_episode).await?;
+                        KeyCode::Enter => {
+                            if let Some(i) = app.history_list_state.selected() {
+                                if let Some(item) = app.history.get(i).cloned() {
+                                    app.prepare_stream_selection(
+                                        item.anime,
+                                        item.episode_session,
+                                        item.last_episode,
+                                    )
+                                    .await?;
+                                }
                             }
                         }
-                    }
-                    KeyCode::Esc => { app.current_screen = CurrentScreen::Search; }
-                    _ => {}
-                },
-                CurrentScreen::EpisodeList => match key.code {
-                    KeyCode::Up => cycle_selection(&mut app.episode_list_state, app.episode_list.len(), true),
-                    KeyCode::Down => cycle_selection(&mut app.episode_list_state, app.episode_list.len(), false),
-                    KeyCode::Left => {
-                        if app.ep_page > 1 {
+                        KeyCode::Esc => {
+                            app.current_screen = CurrentScreen::Search;
+                        }
+                        _ => {}
+                    },
+                    CurrentScreen::EpisodeList => match key.code {
+                        KeyCode::Up => cycle_selection(
+                            &mut app.episode_list_state,
+                            app.episode_list.len(),
+                            true,
+                        ),
+                        KeyCode::Down => cycle_selection(
+                            &mut app.episode_list_state,
+                            app.episode_list.len(),
+                            false,
+                        ),
+                        KeyCode::Left if app.ep_page > 1 => {
                             app.load_episodes(app.ep_page - 1).await;
                         }
-                    }
-                    KeyCode::Right => {
-                        if app.ep_page < app.ep_total_pages {
+                        KeyCode::Right if app.ep_page < app.ep_total_pages => {
                             app.load_episodes(app.ep_page + 1).await;
                         }
-                    }
-                    KeyCode::Char('/') => { 
-                        app.is_searching = true;
-                        app.search_query.clear();
-                    }
-                    KeyCode::Enter => {
-                        app.play_episode().await?;
-                    }
-                    KeyCode::Esc => {
-                        app.current_screen = match () {
-                            _ if !app.search_results.is_empty() => CurrentScreen::SearchResults,
-                            _ if !app.library.is_empty() => CurrentScreen::Library,
-                            _ => CurrentScreen::Search,
-                        };
-                    }
-                    _ => {}
-                }
-                CurrentScreen::QualitySelection => match key.code {
-                    KeyCode::Up => cycle_selection(&mut app.quality_list_state, app.available_streams.len(), true),
-                    KeyCode::Down => cycle_selection(&mut app.quality_list_state, app.available_streams.len(), false),
-                    KeyCode::Enter => {
-                        app.play_selected_stream(terminal).await?;
-                    }
-                    KeyCode::Esc => {
-                        app.current_screen = app.previous_screen.take()
-                            .unwrap_or(CurrentScreen::EpisodeList);
-                    }
-                    _ => {}
+                        KeyCode::Char('/') => {
+                            app.is_searching = true;
+                            app.search_query.clear();
+                        }
+                        KeyCode::Enter => {
+                            app.play_episode().await?;
+                        }
+                        KeyCode::Esc => {
+                            app.current_screen = match () {
+                                _ if !app.search_results.is_empty() => CurrentScreen::SearchResults,
+                                _ if !app.library.is_empty() => CurrentScreen::Library,
+                                _ => CurrentScreen::Search,
+                            };
+                        }
+                        _ => {}
+                    },
+                    CurrentScreen::QualitySelection => match key.code {
+                        KeyCode::Up => cycle_selection(
+                            &mut app.quality_list_state,
+                            app.available_streams.len(),
+                            true,
+                        ),
+                        KeyCode::Down => cycle_selection(
+                            &mut app.quality_list_state,
+                            app.available_streams.len(),
+                            false,
+                        ),
+                        KeyCode::Enter => {
+                            app.play_selected_stream(terminal).await?;
+                        }
+                        KeyCode::Esc => {
+                            app.current_screen = app
+                                .previous_screen
+                                .take()
+                                .unwrap_or(CurrentScreen::EpisodeList);
+                        }
+                        _ => {}
+                    },
                 }
             }
-        }
-    } else {
+        } else {
             // No event happen, just tick
             app.animation_tick = app.animation_tick.wrapping_add(1);
         }
@@ -576,21 +684,30 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
 fn ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Length(3), // Search box
-                Constraint::Min(1),    // Main content
-                Constraint::Length(1), // Status bar
-            ]
-        )
+        .constraints([
+            Constraint::Length(3), // Search box
+            Constraint::Min(1),    // Main content
+            Constraint::Length(1), // Status bar
+        ])
         .split(f.area());
 
     // Search Box
-    let search_block = Paragraph::new(format!("Search: {}", app.search_query))
-        .block(Block::default()
+    let search_block = Paragraph::new(format!("Search: {}", app.search_query)).block(
+        Block::default()
             .borders(Borders::ALL)
-            .title(if app.is_searching { " Search [EDITING] " } else { " Enuma Search " })
-            .border_style(Style::default().fg(if app.is_searching { Color::Yellow } else if app.current_screen == CurrentScreen::Search { Color::Cyan } else { Color::White })));
+            .title(if app.is_searching {
+                " Search [EDITING] "
+            } else {
+                " Enuma Search "
+            })
+            .border_style(Style::default().fg(if app.is_searching {
+                Color::Yellow
+            } else if app.current_screen == CurrentScreen::Search {
+                Color::Cyan
+            } else {
+                Color::White
+            })),
+    );
     f.render_widget(search_block, chunks[0]);
 
     // Build library session set once for O(1) lookups in render
@@ -602,84 +719,150 @@ fn ui(f: &mut Frame, app: &mut App) {
     } else {
         match app.current_screen {
             CurrentScreen::Search => {
-            let welcome = Paragraph::new("Welcome to Enuma!\n\nPress '/' to start searching.\n\nControls:\n- '/': Focus Search bar\n- Enter (while searching): Perform search\n- Esc (while searching): Cancel search\n\nNavigation:\n- 'l': View Library\n- 'h': View History\n- Esc: Exit app")
+                let welcome = Paragraph::new("Welcome to Enuma!\n\nPress '/' to start searching.\n\nControls:\n- '/': Focus Search bar\n- Enter (while searching): Perform search\n- Esc (while searching): Cancel search\n\nNavigation:\n- 'l': View Library\n- 'h': View History\n- Esc: Exit app")
                 .block(Block::default().borders(Borders::ALL).title(" Help ").border_style(Style::default().fg(Color::Gray)))
                 .wrap(Wrap { trim: true })
                 .style(Style::default().fg(Color::White));
-            f.render_widget(welcome, chunks[1]);
-        }
-        CurrentScreen::SearchResults => {
-            render_anime_list(f, chunks[1], &app.search_results, &mut app.search_list_state, &lib_sessions, " Results ");
-        }
-        CurrentScreen::Library => {
-            if app.library.is_empty() {
-                let empty = Paragraph::new("Library is empty. Search and press 'f' to add some!")
-                    .block(Block::default().borders(Borders::ALL).title(" Library ").border_style(Style::default().fg(Color::Cyan)))
-                    .style(Style::default().fg(Color::Yellow));
-                f.render_widget(empty, chunks[1]);
-            } else {
-                render_anime_list(f, chunks[1], &app.library, &mut app.library_list_state, &lib_sessions, " Library ");
+                f.render_widget(welcome, chunks[1]);
             }
-        }
-        CurrentScreen::History => {
-            if app.history.is_empty() {
-                let empty = Paragraph::new("No watch history yet.")
-                    .block(Block::default().borders(Borders::ALL).title(" History ").border_style(Style::default().fg(Color::Cyan)))
-                    .style(Style::default().fg(Color::Yellow));
-                f.render_widget(empty, chunks[1]);
-            } else {
-                render_history_list(f, chunks[1], &app.history, &mut app.history_list_state, &lib_sessions);
+            CurrentScreen::SearchResults => {
+                render_anime_list(
+                    f,
+                    chunks[1],
+                    &app.search_results,
+                    &mut app.search_list_state,
+                    &lib_sessions,
+                    " Results ",
+                );
             }
-        }
-        CurrentScreen::EpisodeList => {
-             let items: Vec<ListItem> = app.episode_list
-                .iter()
-                .map(|ep| ListItem::new(format!(" Episode {}", ep.episode)))
-                .collect();
+            CurrentScreen::Library => {
+                if app.library.is_empty() {
+                    let empty =
+                        Paragraph::new("Library is empty. Search and press 'f' to add some!")
+                            .block(
+                                Block::default()
+                                    .borders(Borders::ALL)
+                                    .title(" Library ")
+                                    .border_style(Style::default().fg(Color::Cyan)),
+                            )
+                            .style(Style::default().fg(Color::Yellow));
+                    f.render_widget(empty, chunks[1]);
+                } else {
+                    render_anime_list(
+                        f,
+                        chunks[1],
+                        &app.library,
+                        &mut app.library_list_state,
+                        &lib_sessions,
+                        " Library ",
+                    );
+                }
+            }
+            CurrentScreen::History => {
+                if app.history.is_empty() {
+                    let empty = Paragraph::new("No watch history yet.")
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(" History ")
+                                .border_style(Style::default().fg(Color::Cyan)),
+                        )
+                        .style(Style::default().fg(Color::Yellow));
+                    f.render_widget(empty, chunks[1]);
+                } else {
+                    render_history_list(
+                        f,
+                        chunks[1],
+                        &app.history,
+                        &mut app.history_list_state,
+                        &lib_sessions,
+                    );
+                }
+            }
+            CurrentScreen::EpisodeList => {
+                let items: Vec<ListItem> = app
+                    .episode_list
+                    .iter()
+                    .map(|ep| ListItem::new(format!(" Episode {}", ep.episode)))
+                    .collect();
 
-            let title = format!(" Episodes - Page {}/{} ", app.ep_page, app.ep_total_pages);
-            let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(Color::Cyan)))
-                .highlight_style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Magenta))
-                .highlight_symbol("▶ ");
-                
-            f.render_stateful_widget(list, chunks[1], &mut app.episode_list_state);
-        }
-        CurrentScreen::QualitySelection => {
-             let items: Vec<ListItem> = app.available_streams
-                .iter()
-                .map(|s| ListItem::new(format!(" {}", s.name)))
-                .collect();
+                let title = format!(" Episodes - Page {}/{} ", app.ep_page, app.ep_total_pages);
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(title)
+                            .border_style(Style::default().fg(Color::Cyan)),
+                    )
+                    .highlight_style(
+                        Style::default()
+                            .add_modifier(Modifier::BOLD)
+                            .fg(Color::Magenta),
+                    )
+                    .highlight_symbol("▶ ");
 
-            let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(" Select Quality ").border_style(Style::default().fg(Color::Cyan)))
-                .highlight_style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))
-                .highlight_symbol("▶ ");
-                
-            f.render_stateful_widget(list, chunks[1], &mut app.quality_list_state);
+                f.render_stateful_widget(list, chunks[1], &mut app.episode_list_state);
+            }
+            CurrentScreen::QualitySelection => {
+                let items: Vec<ListItem> = app
+                    .available_streams
+                    .iter()
+                    .map(|s| ListItem::new(format!(" {}", s.name)))
+                    .collect();
+
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Select Quality ")
+                            .border_style(Style::default().fg(Color::Cyan)),
+                    )
+                    .highlight_style(
+                        Style::default()
+                            .add_modifier(Modifier::BOLD)
+                            .fg(Color::Yellow),
+                    )
+                    .highlight_symbol("▶ ");
+
+                f.render_stateful_widget(list, chunks[1], &mut app.quality_list_state);
+            }
         }
     }
-}
 
-fn render_loading_animation(f: &mut Frame, area: Rect, tick: u32) {
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let frame = frames[(tick as usize) % frames.len()];
-    
-    let text = format!("\n\n\n  {}  LOADING...  ", frame);
-    let loading = Paragraph::new(text)
-        .alignment(ratatui::layout::Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)))
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-    
-    f.render_widget(loading, area);
-}
+    fn render_loading_animation(f: &mut Frame, area: Rect, tick: u32) {
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let frame = frames[(tick as usize) % frames.len()];
+
+        let text = format!("\n\n\n  {}  LOADING...  ", frame);
+        let loading = Paragraph::new(text)
+            .alignment(ratatui::layout::Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow)),
+            )
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            );
+
+        f.render_widget(loading, area);
+    }
     // Status Bar
     let status = Paragraph::new(format!(" {}", app.status_message))
         .style(Style::default().fg(Color::Black).bg(Color::Cyan));
     f.render_widget(status, chunks[2]);
 }
 
-fn render_anime_list(f: &mut Frame, area: Rect, list_data: &[Anime], state: &mut ListState, lib_sessions: &HashSet<&str>, title: &str) {
+fn render_anime_list(
+    f: &mut Frame,
+    area: Rect,
+    list_data: &[Anime],
+    state: &mut ListState,
+    lib_sessions: &HashSet<&str>,
+    title: &str,
+) {
     let layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -688,15 +871,28 @@ fn render_anime_list(f: &mut Frame, area: Rect, list_data: &[Anime], state: &mut
     let items: Vec<ListItem> = list_data
         .iter()
         .map(|i| {
-            let lib_mark = if lib_sessions.contains(i.session.as_str()) { "❤ " } else { "  " };
+            let lib_mark = if lib_sessions.contains(i.session.as_str()) {
+                "❤ "
+            } else {
+                "  "
+            };
             let title = truncate_str(&i.title, 37);
             ListItem::new(format!("{}{}", lib_mark, title))
         })
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(Color::Cyan)))
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Yellow),
+        )
         .highlight_symbol("▶ ");
 
     f.render_stateful_widget(list, layout[0], state);
@@ -709,7 +905,13 @@ fn render_anime_list(f: &mut Frame, area: Rect, list_data: &[Anime], state: &mut
     }
 }
 
-fn render_history_list(f: &mut Frame, area: Rect, list_data: &[HistoryItem], state: &mut ListState, lib_sessions: &HashSet<&str>) {
+fn render_history_list(
+    f: &mut Frame,
+    area: Rect,
+    list_data: &[HistoryItem],
+    state: &mut ListState,
+    lib_sessions: &HashSet<&str>,
+) {
     let layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -718,15 +920,31 @@ fn render_history_list(f: &mut Frame, area: Rect, list_data: &[HistoryItem], sta
     let items: Vec<ListItem> = list_data
         .iter()
         .map(|h| {
-            let lib_mark = if lib_sessions.contains(h.anime.session.as_str()) { "❤ " } else { "  " };
+            let lib_mark = if lib_sessions.contains(h.anime.session.as_str()) {
+                "❤ "
+            } else {
+                "  "
+            };
             let title = truncate_str(&h.anime.title, 27);
-            ListItem::new(format!("{}{:<35} Ep {:<3} [{}]", lib_mark, title, h.last_episode, h.last_watched))
+            ListItem::new(format!(
+                "{}{:<35} Ep {:<3} [{}]",
+                lib_mark, title, h.last_episode, h.last_watched
+            ))
         })
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" History ").border_style(Style::default().fg(Color::Cyan)))
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" History ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Yellow),
+        )
         .highlight_symbol("▶ ");
 
     f.render_stateful_widget(list, layout[0], state);
@@ -745,13 +963,31 @@ fn render_details(f: &mut Frame, area: Rect, anime: &Anime, lib_sessions: &HashS
         anime.title,
         anime.anime_type.as_deref().unwrap_or("Unknown"),
         anime.status,
-        anime.episodes.map(|e| e.to_string()).unwrap_or_else(|| "Unknown".to_string()),
-        anime.score.map(|s| s.to_string()).unwrap_or_else(|| "N/A".to_string()),
-        anime.year.map(|y| y.to_string()).unwrap_or_else(|| "Unknown".to_string()),
-        if is_lib { "[ In Library ❤ ]" } else { "[ Press 'f' to add to library ]" }
+        anime
+            .episodes
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "Unknown".to_string()),
+        anime
+            .score
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "N/A".to_string()),
+        anime
+            .year
+            .map(|y| y.to_string())
+            .unwrap_or_else(|| "Unknown".to_string()),
+        if is_lib {
+            "[ In Library ❤ ]"
+        } else {
+            "[ Press 'f' to add to library ]"
+        }
     );
     let details_p = Paragraph::new(details)
-        .block(Block::default().borders(Borders::ALL).title(" Details ").border_style(Style::default().fg(Color::Gray)))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Details ")
+                .border_style(Style::default().fg(Color::Gray)),
+        )
         .wrap(Wrap { trim: true })
         .style(Style::default().fg(Color::White));
     f.render_widget(details_p, area);
